@@ -107,6 +107,9 @@ $RECYCLE.BIN/
 *.sqlite
 *.db
 
+# CSV exports
+*.csv
+
 # Temporary files
 *.tmp
 *.temp
