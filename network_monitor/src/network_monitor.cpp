@@ -5,6 +5,19 @@
 #include <iomanip>
 #include <thread>
 #include <cstring>
+#include <sys/socket.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/time.h>
+#include <algorithm>
+#include <cmath>
+#include <ctime>
+#include <sstream>
 
 NetworkMonitor::NetworkMonitor() {
     detectInterfaces();
@@ -189,9 +202,34 @@ void NetworkMonitor::displayBandwidth(const std::string& interface) {
     }
 }
 
+// Get bandwidth values for a specific interface (helper for logging)
+bool NetworkMonitor::getBandwidth(const std::string& interface, double& download_bps, double& upload_bps) {
+    InterfaceStats stats1, stats2;
+    
+    // First reading
+    if (!readInterfaceStats(interface, stats1)) {
+        return false;
+    }
+    
+    // Wait 1 second
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    
+    // Second reading
+    if (!readInterfaceStats(interface, stats2)) {
+        return false;
+    }
+    
+    // Calculate bandwidth
+    calculateBandwidth(stats1, stats2, download_bps, upload_bps);
+    return true;
+}
+
 // Monitor bandwidth continuously
-void NetworkMonitor::monitorBandwidthContinuous(const std::string& interface, int interval_seconds) {
+void NetworkMonitor::monitorBandwidthContinuous(const std::string& interface, int interval_seconds,
+                                                const std::string& log_file) {
     InterfaceStats prev_stats, current_stats;
+    bool log_enabled = !log_file.empty();
+    bool log_notice_shown = false;
     
     std::cout << "Starting continuous bandwidth monitoring for interface: " << interface << std::endl;
     std::cout << "Press Ctrl+C to stop..." << std::endl << std::endl;
@@ -248,36 +286,612 @@ void NetworkMonitor::monitorBandwidthContinuous(const std::string& interface, in
         
         std::cout << std::endl;
         
+        // Log results to CSV if enabled
+        if (log_enabled) {
+            if (logBandwidthToCSV(log_file, interface, download_bps, upload_bps) && !log_notice_shown) {
+                std::cout << "Logging continuous measurements to: " << log_file << std::endl;
+                log_notice_shown = true;
+            }
+        }
+        
         // Update previous stats
         prev_stats = current_stats;
     }
 }
 
-// Placeholder implementations for future phases
+// ICMP Helper Functions for Phase 2
+
+// Calculate ICMP checksum
+unsigned short NetworkMonitor::calculateChecksum(unsigned short* buffer, int length) {
+    unsigned long sum = 0;
+    unsigned short* ptr = buffer;
+    
+    // Sum all 16-bit words
+    while (length > 1) {
+        sum += *ptr++;
+        length -= 2;
+    }
+    
+    // Add any remaining byte
+    if (length > 0) {
+        sum += *(unsigned char*)ptr;
+    }
+    
+    // Fold 32-bit sum to 16 bits
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    
+    return (unsigned short)(~sum);
+}
+
+// Resolve hostname to IP address
+bool NetworkMonitor::resolveHostname(const std::string& hostname, struct sockaddr_in* addr) {
+    struct hostent* host_entry;
+    
+    // Try to convert as IP address first
+    if (inet_addr(hostname.c_str()) != INADDR_NONE) {
+        addr->sin_addr.s_addr = inet_addr(hostname.c_str());
+        addr->sin_family = AF_INET;
+        return true;
+    }
+    
+    // Try DNS resolution
+    host_entry = gethostbyname(hostname.c_str());
+    if (host_entry == nullptr) {
+        return false;
+    }
+    
+    addr->sin_family = AF_INET;
+    addr->sin_addr = *(struct in_addr*)host_entry->h_addr_list[0];
+    return true;
+}
+
+// Create raw socket for ICMP
+int NetworkMonitor::createRawSocket() {
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (sock < 0) {
+        return -1;
+    }
+    
+    // Set socket timeout
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    return sock;
+}
+
+// Phase 2: ICMP-based latency measurement
 LatencyResult NetworkMonitor::measureLatency(const std::string& host, int timeout_ms) {
-    // To be implemented in Phase 2
     LatencyResult result;
     result.host = host;
     result.success = false;
     result.rtt_ms = 0.0;
-    std::cout << "Latency measurement will be implemented in Phase 2" << std::endl;
+    
+    // Resolve hostname to IP address
+    struct sockaddr_in dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    
+    if (!resolveHostname(host, &dest_addr)) {
+        std::cerr << "Error: Could not resolve hostname: " << host << std::endl;
+        return result;
+    }
+    
+    // Create raw socket
+    int sock = createRawSocket();
+    if (sock < 0) {
+        std::cerr << "Error: Could not create raw socket. Root privileges required." << std::endl;
+        return result;
+    }
+    
+    // Build ICMP packet
+    struct icmphdr icmp_hdr;
+    memset(&icmp_hdr, 0, sizeof(icmp_hdr));
+    icmp_hdr.type = ICMP_ECHO;
+    icmp_hdr.code = 0;
+    icmp_hdr.un.echo.id = getpid() & 0xFFFF;  // Use process ID as identifier
+    icmp_hdr.un.echo.sequence = 1;
+    icmp_hdr.checksum = 0;
+    
+    // Calculate checksum
+    icmp_hdr.checksum = calculateChecksum((unsigned short*)&icmp_hdr, sizeof(icmp_hdr));
+    
+    // Record send time
+    auto send_time = std::chrono::steady_clock::now();
+    
+    // Send ICMP echo request
+    ssize_t sent = sendto(sock, &icmp_hdr, sizeof(icmp_hdr), 0,
+                          (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+    
+    if (sent < 0) {
+        std::cerr << "Error: Failed to send ICMP packet: " << strerror(errno) << std::endl;
+        close(sock);
+        return result;
+    }
+    
+    // Set receive timeout
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    // Receive ICMP echo reply
+    char recv_buffer[1024];
+    struct sockaddr_in recv_addr;
+    socklen_t addr_len = sizeof(recv_addr);
+    
+    ssize_t received = recvfrom(sock, recv_buffer, sizeof(recv_buffer), 0,
+                                (struct sockaddr*)&recv_addr, &addr_len);
+    
+    // Record receive time
+    auto recv_time = std::chrono::steady_clock::now();
+    
+    close(sock);
+    
+    if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            std::cerr << "Error: Timeout waiting for ICMP reply from " << host << std::endl;
+        } else {
+            std::cerr << "Error: Failed to receive ICMP reply: " << strerror(errno) << std::endl;
+        }
+        return result;
+    }
+    
+    // Parse IP header to get to ICMP header
+    struct iphdr* ip_hdr = (struct iphdr*)recv_buffer;
+    int ip_header_len = ip_hdr->ihl * 4;
+    
+    if (received < static_cast<ssize_t>(ip_header_len + sizeof(struct icmphdr))) {
+        std::cerr << "Error: Received packet too short" << std::endl;
+        return result;
+    }
+    
+    struct icmphdr* recv_icmp = (struct icmphdr*)(recv_buffer + ip_header_len);
+    
+    // Verify it's an echo reply and matches our request
+    if (recv_icmp->type == ICMP_ECHOREPLY && 
+        recv_icmp->un.echo.id == (getpid() & 0xFFFF)) {
+        // Calculate RTT
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(recv_time - send_time);
+        result.rtt_ms = duration.count() / 1000.0;
+        result.success = true;
+    } else {
+        std::cerr << "Error: Received unexpected ICMP packet type: " << (int)recv_icmp->type << std::endl;
+    }
+    
     return result;
 }
 
+// Phase 3: Packet loss detection with jitter calculation
 PacketLossStats NetworkMonitor::detectPacketLoss(const std::string& host, int count) {
-    // To be implemented in Phase 3
-    PacketLossStats stats = {0};
-    std::cout << "Packet loss detection will be implemented in Phase 3" << std::endl;
+    PacketLossStats stats = {0, 0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    
+    // Resolve hostname to IP address
+    struct sockaddr_in dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    
+    if (!resolveHostname(host, &dest_addr)) {
+        std::cerr << "Error: Could not resolve hostname: " << host << std::endl;
+        return stats;
+    }
+    
+    // Create raw socket
+    int sock = createRawSocket();
+    if (sock < 0) {
+        std::cerr << "Error: Could not create raw socket. Root privileges required." << std::endl;
+        return stats;
+    }
+    
+    // Set receive timeout (1 second per packet)
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    std::vector<double> rtt_values;
+    int pid = getpid() & 0xFFFF;
+    stats.packets_sent = count;
+    
+    std::cout << "Pinging " << host << " with " << count << " packets..." << std::endl;
+    
+    // Send multiple ICMP packets and collect RTT values
+    for (int seq = 1; seq <= count; seq++) {
+        // Build ICMP packet
+        struct icmphdr icmp_hdr;
+        memset(&icmp_hdr, 0, sizeof(icmp_hdr));
+        icmp_hdr.type = ICMP_ECHO;
+        icmp_hdr.code = 0;
+        icmp_hdr.un.echo.id = pid;
+        icmp_hdr.un.echo.sequence = seq;
+        icmp_hdr.checksum = 0;
+        
+        // Calculate checksum
+        icmp_hdr.checksum = calculateChecksum((unsigned short*)&icmp_hdr, sizeof(icmp_hdr));
+        
+        // Record send time
+        auto send_time = std::chrono::steady_clock::now();
+        
+        // Send ICMP echo request
+        ssize_t sent = sendto(sock, &icmp_hdr, sizeof(icmp_hdr), 0,
+                              (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+        
+        if (sent < 0) {
+            std::cerr << "Warning: Failed to send packet " << seq << std::endl;
+            continue;
+        }
+        
+        // Try to receive reply
+        char recv_buffer[1024];
+        struct sockaddr_in recv_addr;
+        socklen_t addr_len = sizeof(recv_addr);
+        
+        ssize_t received = recvfrom(sock, recv_buffer, sizeof(recv_buffer), 0,
+                                    (struct sockaddr*)&recv_addr, &addr_len);
+        
+        // Record receive time
+        auto recv_time = std::chrono::steady_clock::now();
+        
+        if (received > 0) {
+            // Parse IP header
+            struct iphdr* ip_hdr = (struct iphdr*)recv_buffer;
+            int ip_header_len = ip_hdr->ihl * 4;
+            
+            if (received >= static_cast<ssize_t>(ip_header_len + sizeof(struct icmphdr))) {
+                struct icmphdr* recv_icmp = (struct icmphdr*)(recv_buffer + ip_header_len);
+                
+                // Verify it's an echo reply and matches our request
+                if (recv_icmp->type == ICMP_ECHOREPLY && 
+                    recv_icmp->un.echo.id == pid &&
+                    recv_icmp->un.echo.sequence == seq) {
+                    // Calculate RTT
+                    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(recv_time - send_time);
+                    double rtt_ms = duration.count() / 1000.0;
+                    rtt_values.push_back(rtt_ms);
+                    stats.packets_received++;
+                    
+                    std::cout << "  Packet " << seq << ": " << std::fixed << std::setprecision(2) 
+                              << rtt_ms << " ms" << std::endl;
+                }
+            }
+        }
+        
+        // Small delay between packets
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    close(sock);
+    
+    // Calculate statistics
+    if (stats.packets_received > 0) {
+        // Calculate packet loss percentage
+        stats.loss_percentage = ((count - stats.packets_received) * 100.0) / count;
+        
+        // Calculate min, max, and average RTT
+        stats.min_rtt = *std::min_element(rtt_values.begin(), rtt_values.end());
+        stats.max_rtt = *std::max_element(rtt_values.begin(), rtt_values.end());
+        
+        double sum = 0.0;
+        for (double rtt : rtt_values) {
+            sum += rtt;
+        }
+        stats.avg_rtt = sum / rtt_values.size();
+        
+        // Calculate jitter (standard deviation of RTT)
+        if (rtt_values.size() > 1) {
+            double variance = 0.0;
+            for (double rtt : rtt_values) {
+                double diff = rtt - stats.avg_rtt;
+                variance += diff * diff;
+            }
+            variance /= rtt_values.size();
+            stats.jitter = std::sqrt(variance);
+        } else {
+            stats.jitter = 0.0;
+        }
+    } else {
+        stats.loss_percentage = 100.0;
+    }
+    
     return stats;
 }
 
+// Phase 3: Display active network connections
 void NetworkMonitor::displayActiveConnections() {
-    // To be implemented in Phase 3
-    std::cout << "Connection statistics will be implemented in Phase 3" << std::endl;
+    std::cout << "Active Network Connections" << std::endl;
+    std::cout << "==========================" << std::endl << std::endl;
+    
+    int tcp_count = 0;
+    int udp_count = 0;
+    int tcp_established = 0;
+    int udp_established = 0;
+    
+    // Parse TCP connections
+    std::ifstream tcp_file("/proc/net/tcp");
+    if (tcp_file.is_open()) {
+        std::string line;
+        std::getline(tcp_file, line); // Skip header
+        
+        while (std::getline(tcp_file, line)) {
+            if (line.empty()) continue;
+            
+            std::istringstream iss(line);
+            std::string sl, local_address, rem_address, st, tx_queue, rx_queue, tr, tm_when, retrnsmt, uid, timeout, inode;
+            
+            iss >> sl >> local_address >> rem_address >> st >> tx_queue >> rx_queue 
+                >> tr >> tm_when >> retrnsmt >> uid >> timeout >> inode;
+            
+            if (!st.empty()) {
+                int state = std::stoi(st, nullptr, 16);
+                tcp_count++;
+                
+                // State 01 = ESTABLISHED
+                if (state == 0x01) {
+                    tcp_established++;
+                }
+            }
+        }
+        tcp_file.close();
+    }
+    
+    // Parse UDP connections
+    std::ifstream udp_file("/proc/net/udp");
+    if (udp_file.is_open()) {
+        std::string line;
+        std::getline(udp_file, line); // Skip header
+        
+        while (std::getline(udp_file, line)) {
+            if (line.empty()) continue;
+            
+            std::istringstream iss(line);
+            std::string sl, local_address, rem_address, st, tx_queue, rx_queue, tr, tm_when, retrnsmt, uid, timeout, inode;
+            
+            iss >> sl >> local_address >> rem_address >> st >> tx_queue >> rx_queue 
+                >> tr >> tm_when >> retrnsmt >> uid >> timeout >> inode;
+            
+            if (!st.empty()) {
+                udp_count++;
+                udp_established++;
+            }
+        }
+        udp_file.close();
+    }
+    
+    // Display statistics
+    std::cout << "TCP Connections:" << std::endl;
+    std::cout << "  Total: " << tcp_count << std::endl;
+    std::cout << "  Established: " << tcp_established << std::endl;
+    std::cout << std::endl;
+    
+    std::cout << "UDP Connections:" << std::endl;
+    std::cout << "  Total: " << udp_count << std::endl;
+    std::cout << std::endl;
+    
+    std::cout << "Total Active Connections: " << (tcp_count + udp_count) << std::endl;
 }
 
+// Get connection statistics (helper for logging)
+bool NetworkMonitor::getConnectionStats(int& tcp_total, int& tcp_established, int& udp_total) {
+    tcp_total = 0;
+    tcp_established = 0;
+    udp_total = 0;
+    
+    // Parse TCP connections
+    std::ifstream tcp_file("/proc/net/tcp");
+    if (tcp_file.is_open()) {
+        std::string line;
+        std::getline(tcp_file, line); // Skip header
+        
+        while (std::getline(tcp_file, line)) {
+            if (line.empty()) continue;
+            
+            std::istringstream iss(line);
+            std::string sl, local_address, rem_address, st, tx_queue, rx_queue, tr, tm_when, retrnsmt, uid, timeout, inode;
+            
+            iss >> sl >> local_address >> rem_address >> st >> tx_queue >> rx_queue 
+                >> tr >> tm_when >> retrnsmt >> uid >> timeout >> inode;
+            
+            if (!st.empty()) {
+                int state = std::stoi(st, nullptr, 16);
+                tcp_total++;
+                
+                if (state == 0x01) {
+                    tcp_established++;
+                }
+            }
+        }
+        tcp_file.close();
+    }
+    
+    // Parse UDP connections
+    std::ifstream udp_file("/proc/net/udp");
+    if (udp_file.is_open()) {
+        std::string line;
+        std::getline(udp_file, line); // Skip header
+        
+        while (std::getline(udp_file, line)) {
+            if (line.empty()) continue;
+            
+            std::istringstream iss(line);
+            std::string sl, local_address, rem_address, st, tx_queue, rx_queue, tr, tm_when, retrnsmt, uid, timeout, inode;
+            
+            iss >> sl >> local_address >> rem_address >> st >> tx_queue >> rx_queue 
+                >> tr >> tm_when >> retrnsmt >> uid >> timeout >> inode;
+            
+            if (!st.empty()) {
+                udp_total++;
+            }
+        }
+        udp_file.close();
+    }
+    
+    return true;
+}
+
+// Phase 4: CSV Data Logging
+
+// Get current timestamp as string
+std::string getCurrentTimestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&time_t_now), "%Y-%m-%d %H:%M:%S");
+    return ss.str();
+}
+
+// Log bandwidth data to CSV
+bool NetworkMonitor::logBandwidthToCSV(const std::string& filename, const std::string& interface,
+                                       double download_bps, double upload_bps) {
+    std::ofstream csv_file;
+    
+    // Check if file exists to determine if we need headers
+    bool file_exists = std::ifstream(filename).good();
+    
+    csv_file.open(filename, std::ios::app);
+    if (!csv_file.is_open()) {
+        std::cerr << "Error: Could not open CSV file: " << filename << std::endl;
+        return false;
+    }
+    
+    // Write header if new file
+    if (!file_exists) {
+        csv_file << "Timestamp,Interface,Download_bps,Upload_bps,Download_Mbps,Upload_Mbps\n";
+    }
+    
+    // Write data
+    csv_file << getCurrentTimestamp() << ","
+             << interface << ","
+             << std::fixed << std::setprecision(2)
+             << download_bps << ","
+             << upload_bps << ","
+             << (download_bps / 1000000.0) << ","
+             << (upload_bps / 1000000.0) << "\n";
+    
+    csv_file.close();
+    return true;
+}
+
+// Log latency measurement to CSV
+bool NetworkMonitor::logLatencyToCSV(const std::string& filename, const LatencyResult& result) {
+    std::ofstream csv_file;
+    
+    bool file_exists = std::ifstream(filename).good();
+    
+    csv_file.open(filename, std::ios::app);
+    if (!csv_file.is_open()) {
+        std::cerr << "Error: Could not open CSV file: " << filename << std::endl;
+        return false;
+    }
+    
+    // Write header if new file
+    if (!file_exists) {
+        csv_file << "Timestamp,Host,RTT_ms,Success\n";
+    }
+    
+    // Write data
+    csv_file << getCurrentTimestamp() << ","
+             << result.host << ","
+             << std::fixed << std::setprecision(2)
+             << result.rtt_ms << ","
+             << (result.success ? "Yes" : "No") << "\n";
+    
+    csv_file.close();
+    return true;
+}
+
+// Log packet loss statistics to CSV
+bool NetworkMonitor::logPacketLossToCSV(const std::string& filename, const std::string& host,
+                                       const PacketLossStats& stats) {
+    std::ofstream csv_file;
+    
+    bool file_exists = std::ifstream(filename).good();
+    
+    csv_file.open(filename, std::ios::app);
+    if (!csv_file.is_open()) {
+        std::cerr << "Error: Could not open CSV file: " << filename << std::endl;
+        return false;
+    }
+    
+    // Write header if new file
+    if (!file_exists) {
+        csv_file << "Timestamp,Host,Packets_Sent,Packets_Received,Loss_Percentage,"
+                 << "Min_RTT_ms,Max_RTT_ms,Avg_RTT_ms,Jitter_ms\n";
+    }
+    
+    // Write data
+    csv_file << getCurrentTimestamp() << ","
+             << host << ","
+             << stats.packets_sent << ","
+             << stats.packets_received << ","
+             << std::fixed << std::setprecision(2)
+             << stats.loss_percentage << ","
+             << stats.min_rtt << ","
+             << stats.max_rtt << ","
+             << stats.avg_rtt << ","
+             << stats.jitter << "\n";
+    
+    csv_file.close();
+    return true;
+}
+
+// Log connection statistics to CSV
+bool NetworkMonitor::logConnectionsToCSV(const std::string& filename, int tcp_total, 
+                                         int tcp_established, int udp_total) {
+    std::ofstream csv_file;
+    
+    bool file_exists = std::ifstream(filename).good();
+    
+    csv_file.open(filename, std::ios::app);
+    if (!csv_file.is_open()) {
+        std::cerr << "Error: Could not open CSV file: " << filename << std::endl;
+        return false;
+    }
+    
+    // Write header if new file
+    if (!file_exists) {
+        csv_file << "Timestamp,TCP_Total,TCP_Established,UDP_Total,Total_Connections\n";
+    }
+    
+    // Write data
+    csv_file << getCurrentTimestamp() << ","
+             << tcp_total << ","
+             << tcp_established << ","
+             << udp_total << ","
+             << (tcp_total + udp_total) << "\n";
+    
+    csv_file.close();
+    return true;
+}
+
+// General CSV logging function (logs current bandwidth for default interface)
 void NetworkMonitor::logToCSV(const std::string& filename) {
-    // To be implemented in Phase 4
-    std::cout << "CSV logging will be implemented in Phase 4" << std::endl;
+    if (available_interfaces_.empty()) {
+        std::cerr << "Error: No interfaces available for logging" << std::endl;
+        return;
+    }
+    
+    // Use first available interface
+    std::string interface = available_interfaces_[0];
+    InterfaceStats stats1, stats2;
+    
+    if (!readInterfaceStats(interface, stats1)) {
+        std::cerr << "Error: Could not read interface stats" << std::endl;
+        return;
+    }
+    
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    
+    if (!readInterfaceStats(interface, stats2)) {
+        std::cerr << "Error: Could not read interface stats" << std::endl;
+        return;
+    }
+    
+    double download_bps, upload_bps;
+    calculateBandwidth(stats1, stats2, download_bps, upload_bps);
+    
+    if (logBandwidthToCSV(filename, interface, download_bps, upload_bps)) {
+        std::cout << "Bandwidth data logged to: " << filename << std::endl;
+    }
 }
 

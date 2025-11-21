@@ -49,7 +49,9 @@ public:
     
     // Display functions
     void displayBandwidth(const std::string& interface);
-    void monitorBandwidthContinuous(const std::string& interface, int interval_seconds = 1);
+    bool getBandwidth(const std::string& interface, double& download_bps, double& upload_bps);
+    void monitorBandwidthContinuous(const std::string& interface, int interval_seconds = 1,
+                                    const std::string& log_file = "");
     
     // Latency measurement (to be implemented in Phase 2)
     LatencyResult measureLatency(const std::string& host, int timeout_ms = 1000);
@@ -57,11 +59,19 @@ public:
     // Packet loss detection (to be implemented in Phase 3)
     PacketLossStats detectPacketLoss(const std::string& host, int count = 10);
     
-    // Connection statistics (to be implemented in Phase 3)
+    // Connection statistics (Phase 3)
     void displayActiveConnections();
+    bool getConnectionStats(int& tcp_total, int& tcp_established, int& udp_total);
     
-    // Data logging (to be implemented in Phase 4)
+    // Data logging (Phase 4)
     void logToCSV(const std::string& filename);
+    bool logBandwidthToCSV(const std::string& filename, const std::string& interface, 
+                          double download_bps, double upload_bps);
+    bool logLatencyToCSV(const std::string& filename, const LatencyResult& result);
+    bool logPacketLossToCSV(const std::string& filename, const std::string& host, 
+                           const PacketLossStats& stats);
+    bool logConnectionsToCSV(const std::string& filename, int tcp_total, int tcp_established, 
+                            int udp_total);
 
 private:
     std::vector<std::string> available_interfaces_;
@@ -71,6 +81,11 @@ private:
     bool parseProcNetDev(std::map<std::string, InterfaceStats>& stats);
     double calculateTimeDiff(const std::chrono::steady_clock::time_point& start,
                             const std::chrono::steady_clock::time_point& end);
+    
+    // ICMP helper functions for Phase 2
+    unsigned short calculateChecksum(unsigned short* buffer, int length);
+    bool resolveHostname(const std::string& hostname, struct sockaddr_in* addr);
+    int createRawSocket();
 };
 
 #endif // NETWORK_MONITOR_H
